@@ -409,9 +409,7 @@ export function createInlineFeature(env = {}) {
     //   深度窗外的楼直接不观察、不挂（连快照都不建 DOM，只静静躺在 extra 里）。
     //
     // 深度按最近 N 个 AI 楼确定，但窗口覆盖其间用户楼；仅当前最后一个可见楼读活态出口，其余一律读各自快照。
-
-
-
+    const renderedBoxes = new WeakMap();
 
     const clearTimer = key => { if (key) clearTimeout(key); };
     const clearLegacy = () => {
@@ -459,7 +457,6 @@ export function createInlineFeature(env = {}) {
         const rect = el.getBoundingClientRect();
         return rect.bottom > 0 && rect.top < (win?.innerHeight || doc?.documentElement?.clientHeight || 0);
     };
-    const boxSignature = (html, isLatest) => `${isLatest ? 'L' : 'H'}:${html.length}:${html.slice(0, 24)}:${html.slice(-24)}`;
     const unmount = el => el?.querySelectorAll?.(BOX_SELECTOR)?.forEach(box => box.remove());
     const directBoxes = msg => [...(msg?.querySelectorAll?.(':scope > ' + BOX_SELECTOR) || [])];
     const mount = (el, isLatest) => {
@@ -482,10 +479,10 @@ export function createInlineFeature(env = {}) {
             : composeInlineBox(snap, isLatest, floorClock, floor);
         const boxes = directBoxes(msg);
         if (!html) { boxes.forEach(box => box.remove()); return; }
-        const sig = boxSignature(html, isLatest);
-        // 宿主重绘可能留下多个同级框：统一收敛为一个。相同签名保留首个，保住展开态。
+        // 宿主重绘可能留下多个同级框：统一收敛为一个。正文逐字相同才保留首个，保住展开态。
         const existing = boxes[0];
-        if (existing?.dataset?.sig === sig) {
+        const rendered = existing ? renderedBoxes.get(existing) : null;
+        if (rendered?.html === html && rendered.isLatest === isLatest) {
             boxes.slice(1).forEach(box => box.remove());
             return;
         }
@@ -494,7 +491,7 @@ export function createInlineFeature(env = {}) {
         holder.innerHTML = html;
         const box = holder.firstElementChild;
         if (!box) return;
-        box.dataset.sig = sig;
+        renderedBoxes.set(box, { html, isLatest });
         msg.appendChild(box);
         env.syncTheme?.(doc, box);
     };

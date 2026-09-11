@@ -163,6 +163,8 @@ export async function postChatCompletion(options = {}) {
             phase: 'response',
             httpStatus: lifecycle.httpStatus,
             attempt: lifecycle.attempt,
+            finishReason: lifecycle.finishReason,
+            truncated: lifecycle.truncated,
             durationMs: Date.now() - startedAt,
         });
         return result;
@@ -309,7 +311,7 @@ async function postChatCompletionCore({ cfg, messages, maxTokens, temperature, s
                     );
                 }
             } else if (stream) {
-                const content = await readSseContent(res, { allowEmptyOutput });
+                const content = await readSseContent(res, { allowEmptyOutput, onFinish: facts => Object.assign(diagnosticLifecycle || {}, facts) });
                 if ((!content && !allowEmptyOutput) || isPlaceholderContent(content)) throw makeDiagnosticError('empty-output', { phase: 'empty-output' });
                 return content;
             } else {
@@ -320,7 +322,7 @@ async function postChatCompletionCore({ cfg, messages, maxTokens, temperature, s
                     throw makeDiagnosticError('invalid-json', { phase: 'response' });
                 }
                 if (data?.error) throw makeDiagnosticError('response-error', { phase: 'response' });
-                return extractCompletion(data, { allowEmptyOutput });
+                return extractCompletion(data, { allowEmptyOutput, onFinish: facts => Object.assign(diagnosticLifecycle || {}, facts) });
             }
         } catch (err) {
             if (timedOut) throw makeDiagnosticError('timeout', { phase: 'request', timeoutSec, status: Number(diagnosticLifecycle?.httpStatus) || undefined });

@@ -197,7 +197,7 @@ import {
     renderDatabaseWorldbookOptions,
     sameDatabaseMemoryUiIdentity,
 } from './business/memory/database.js';
-import { createQianQianJieMemoryAccess, qianQianJieMemoryDiagnostic } from './business/memory/qianqianjie.js';
+import { captureQianQianJieHostIdentity, createQianQianJieMemoryAccess, qianQianJieMemoryDiagnostic, sameQianQianJieHostIdentity } from './business/memory/qianqianjie.js';
 import { createTaskOwnerManager } from './runtime/task-owner.js';
 import { evaluateTaskLifecycle } from './runtime/task-orchestration.js';
 import { parseLines as parseCanonicalLines, TERMINAL_LINE_STAGES } from './business/lines/schema.js';
@@ -286,13 +286,8 @@ store.bindStoreMetadataPersistence({
                 isCurrent: ownerGuard,
             });
         }
-        if (typeof current.saveMetadata !== 'function') return { ok: false, reason: 'saveMetadata-unavailable', commitState: 'not-dispatched', dispatched: false };
         try {
-            const result = current.saveMetadata();
-            if (!result || typeof result.then !== 'function') return { ok: false, reason: 'saveMetadata-unconfirmed', commitState: 'legacy-unconfirmed', dispatched: true };
-            await result;
-            if (!ownerGuard()) return { ok: false, reason: 'stale-after-save', commitState: 'legacy-unconfirmed', dispatched: true };
-            return { ok: true, reason: 'saveMetadata-promise-resolved', commitState: 'confirmed', dispatched: true };
+            return await ledgerMetadataSaverReady.commit(current, { ...options, target, ownerGuard, rootKey: 'sp-store' });
         } catch (error) {
             const status = Number(error?.status ?? error?.statusCode ?? error?.httpStatus);
             return { ok: false, reason: Number.isInteger(status) ? `http-${status}` : 'saveMetadata-rejected', ...(Number.isInteger(status) ? { status } : {}), commitState: 'not-dispatched', dispatched: false, error };
@@ -511,6 +506,7 @@ const pointController = createPointController({
     showPanel,
     setBody,
     loading: loadingHtml,
+    showPrecheckError: message => setBody(`<div class="sp-error"><i class="fa-solid fa-circle-exclamation"></i><p>${escapeHtml(message || '记忆读取失败，请重试')}</p><button class="sp-gen-btn" id="sp-gen-schedule-now">重新生成点</button></div>`),
     abortAuto: () => { _autoRegenSchedAbort?.abort('superseded-owner'); },
     context: getContext,
     captureContext: captureGenerationContext,
@@ -831,7 +827,7 @@ const axisGenerationController = createAxisGenerationController({
     sameParticipantIdentity,
 });
 const axisTransactionController = createAxisTransactionController({
-    chatId: () => getContext().chatId, items: loadAlmanac, conflicts: calendarConflicts, charKey: () => charStableKey(getContext()), anchor: key => getSettings().dateAnchor?.[key],
+    chatId: () => getContext().chatId, items: loadAlmanac, conflicts: calendarConflicts, charKey: () => charStableKey(getContext()), anchor: () => chatAnchorRepository.get(),
     monthCount: cal => calMonthCount(cal), monthDays: (cal, month) => calMonthDays(cal, month), choose: options => customDialog.choose(options), writeBatch: entries => store.writeBatch(entries), setAnchor: (key, month, day) => setDateAnchor(key, month, day),
     syncAlmanac: syncLatestAlmanacBlock, syncSchedule: syncLatestScheduleBlock, pluginEnabled, readCal: () => readStore(getCalDescKey()), readItems: () => readStore(getAlmanacKey())?.items,
     bindings: calendarTemplateBindings, bindingKey: calendarBindingKey, cards: currentCharacterCards, templates: loadCalendarTemplates, clone: cloneCalDesc, saveCal: saveCalDesc, saveSettings: saveSettingsDebounced,
@@ -1549,6 +1545,7 @@ let charViewName       = null;    // confirmed char name; preserved when switchi
 let outlineMode         = false;
 let linesMode           = false;
 const manualEditing = { point: false, lines: false, outline: false };
+const linesMemoryPreflightErrorHtml = message => `<div class="sp-error"><i class="fa-solid fa-circle-exclamation"></i><p>${escapeHtml(message || '记忆读取失败，请重试')}</p><button class="sp-gen-btn" id="sp-gen-lines-now">重新生成线</button></div>`;
 // 线·swipe 重算：楼层单调递增闸（区分真·新楼层 vs swipe/历史重渲染），及"待重算 swipe"标记。
 const linesFeature = createLinesFeature({
     jumpHint: () => SP_JUMP_HINT_LINES,
@@ -1588,7 +1585,8 @@ const linesFeature = createLinesFeature({
     },
     readRaw: () => readStore(getLinesCacheKey())?.raw || '',
     empty: () => renderEmptyLinesState(),
-    loading: () => loadingHtml('正在推演线', 'sp-abort-lines'),
+    loading: label => loadingHtml(label || '正在推演线', 'sp-abort-lines'),
+    preflightError: linesMemoryPreflightErrorHtml,
     renderPanelDom: ({ toolbar, body }) => { $in('#sp-lines-toolbar').html(toolbar); $in('#sp-lines-list').html(body); },
     injectionEnv: {
         context: () => getContext(), settings: getSettings, enabled: injectEnabled,
@@ -1618,6 +1616,7 @@ const linesFeature = createLinesFeature({
         random: () => Math.random(),
         callApi: (prompt, signal, options, identity, contextSnapshot) => callCustomApi(contextSnapshot || getContext(), prompt, loadCfg(), identity?.userName || '用户', identity?.charName || '角色', signal, options?.historyLimit ?? 3, options),
         missingApi: ({ silent }) => { if (!silent && !settingsOpen) toggleSettings(); },
+        memoryFailure: error => { if (linesMode) linesFeature.renderBody(linesMemoryPreflightErrorHtml(diagnosticMessage(error))); },
         onStart: () => {},
         commit: () => {},
         fail: (error, { silent = false } = {}) => { const code = classifyGenerationError(error, { phase: error?.phase || 'request' }); const manual = !silent; const notify = shouldNotifyGeneration({ manual, notifyMode: getSettings().notifyMode, code }); const diagnostic = safeDiagnosticLog('lines', error?.phase || 'request', error, { background: !manual }); console.warn('[SP lines failure]', diagnostic); if (notify && getContext().chatId) showToast(`线生成失败：${diagnosticMessage(error)}`, null, true); }, cleanup: () => {},
@@ -1737,7 +1736,7 @@ const spaceFeature = createSpaceFeature({
         // 轴动作在本 facade 之后初始化；只在真实点击时读取，严禁顶层提前解引用造成 TDZ。
         widgetActions: () => ({
             point: (body, $button, options) => applyPointWidget(body, $button, options),
-            lines: (body, editIdx, $button) => linesFeature.widget.apply(body, editIdx, $button),
+            lines: (body, editIdx, $button, locator) => linesFeature.widget.apply(body, editIdx, $button, locator),
             almanac: (body, $button, index) => axisWidgetActions.applyAlmanacWidget(body, $button, index),
             era: (body, $button) => axisWidgetActions.applyEraWidget(body, $button),
         }),
@@ -2203,7 +2202,7 @@ jQuery(async () => {
     _stListeners.outlineJudge = messageId => outlineFeature.onCharacterMessage(messageId);
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.outlineJudge);
     // 历·确认当前剧情日期。戳优先——戳开且本楼有可解析戳 → **每次**最新楼定型都直读落地、零 API、不进单调闸；
-    // 读不到戳（漏打 / 「谷雨」无月日）才走单调闸 + almanacAutoDetect 决定是否攒够 N 楼调一次 API 兜底 → 写共享 dateAnchor。
+    // 读不到戳（漏打 / 「谷雨」无月日）才走单调闸 + almanacAutoDetect 决定是否攒够 N 楼调一次 API 兜底 → 写当前聊天锚点。
     if (_stListeners.almanacJudge) eventSource.removeListener?.(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.almanacJudge);
     _stListeners.almanacJudge = async (messageId) => {
         if (!pluginEnabled()) return;   // 插件总关：停后台历日期判定
@@ -2968,9 +2967,9 @@ function injectModal() {
                                         <i class="fa-solid ${hasCustomApi ? 'fa-circle-check' : 'fa-triangle-exclamation'}"></i>
                                         ${hasCustomApi
                                             ? '已配置独立 API，后台生成不影响聊天'
-                                            : '未配置独立 API：生成期间将<b>占用聊天通道</b>，无法同时聊天'}
+                                            : '未配置独立 API：构画生成暂不可用，请填写 Base URL 与 API Key'}
                                     </div>
-                                    <p class="sp-cfg-hint">留空则使用酒馆当前模型</p>
+                                    <p class="sp-cfg-hint">模型名留空时使用当前内置默认 gpt-4o-mini</p>
 
                                     <!-- API 存储快切：点假框→就地展开内联预设列表（非原生 select 弹窗，避开 WebView 里弹层被插件盖住）；选一项填入下方输入框即生效；＋新增按域名自动命名、🗑删除，均即时落 settings.json -->
                                     <div class="sp-preset-row">
@@ -4812,18 +4811,49 @@ function checkMemoryMigrationNotice() {
 }
 
 // Called by the three generation triggers (schedule/outline/lines).
-// Returns a Promise<boolean>: true if user wants to continue, false if canceled.
-async function memoryPreCheckConfirm() {
+// 千千结分支同时返回绑定本次 owner 的只读快照；其它记忆源仍沿用 boolean 协议。
+const QQJ_MEMORY_SNAPSHOT_VERSION = 1;
+let memorySourceEpoch = 0;
+function createQianQianJieGenerationSnapshot({ result, operationToken, participantIdentity, hostIdentity, sourceEpoch }) {
+    return Object.freeze({
+        version: QQJ_MEMORY_SNAPSHOT_VERSION,
+        source: 'qianqianjie',
+        operationToken,
+        participantIdentity,
+        hostIdentity,
+        sourceEpoch,
+        reader: result?.reader || null,
+        status: result?.status === 'ready' ? 'ready' : 'empty',
+        text: result?.status === 'ready' ? String(result.text || '') : '',
+    });
+}
+function qianQianJieGenerationBoundaryCurrent(boundary, ctx = getContext()) {
+    return boundary?.sourceEpoch === memorySourceEpoch
+        && getSettings().useQianQianJie === true
+        && sameParticipantIdentity(boundary.participantIdentity, captureParticipantIdentity())
+        && sameQianQianJieHostIdentity(boundary.hostIdentity, captureQianQianJieHostIdentity(ctx));
+}
+function qianQianJieGenerationSnapshotCurrent(snapshot, operationToken, ctx = getContext()) {
+    return snapshot?.version === QQJ_MEMORY_SNAPSHOT_VERSION
+        && snapshot.source === 'qianqianjie'
+        && snapshot.operationToken === operationToken
+        && snapshot.reader === qianQianJieMemoryAccess.reader()
+        && qianQianJieGenerationBoundaryCurrent(snapshot, ctx);
+}
+async function memoryPreCheckConfirm(request = {}) {
     if (getSettings().useQianQianJie) {
-        const result = await qianQianJieMemoryAccess.result();
-        if (result.status === 'ready') return true;
-        return spConfirm({
-            title: '千千结记忆未就绪',
-            body: `${qianQianJieMemoryDiagnostic(result)}。继续生成将不注入千千结历史。`,
-            note: '可以先确认千千结已启用并完成当前聊天的记忆处理。',
-            confirmText: '继续生成',
-            cancelText: '取消',
-        });
+        const contextSnapshot = request.contextSnapshot || getContext();
+        const participantIdentity = request.participantIdentity || captureParticipantIdentity(contextSnapshot);
+        const hostIdentity = captureQianQianJieHostIdentity(contextSnapshot);
+        const sourceEpoch = memorySourceEpoch;
+        const result = await qianQianJieMemoryAccess.result({ signal: request.signal });
+        if (request.signal?.aborted || result.status === 'cancelled' || result.status === 'stale') return false;
+        const boundary = { participantIdentity, hostIdentity, sourceEpoch };
+        if (!qianQianJieGenerationBoundaryCurrent(boundary, contextSnapshot)) return false;
+        if (result.status !== 'ready') return Object.freeze({ proceed: false, memoryError: qianQianJieMemoryDiagnostic(result) });
+        const snapshot = createQianQianJieGenerationSnapshot({ result, operationToken: request.operationToken, participantIdentity, hostIdentity, sourceEpoch });
+        if (!qianQianJieGenerationSnapshotCurrent(snapshot, request.operationToken, contextSnapshot)) return false;
+        return Object.freeze({ proceed: true, memorySnapshot: snapshot });
     }
     // Anima mode: warn only if TavernHelper is missing or the chat-bound
     // worldbook has no anima_summary slices (built-in report is meaningless here).
@@ -5043,7 +5073,7 @@ function abortAlmanacGen() {
     if (axisState.almanacMode) renderAlmanacPanel();
 }
 
-async function generate(ctx, userName, charName, perspective = 'user', signal = null, pinned = null, travelContext = null, adultMode = 'off', diagnosticSink = null) {
+async function generate(ctx, userName, charName, perspective = 'user', signal = null, pinned = null, travelContext = null, adultMode = 'off', diagnosticSink = null, memoryContext = null) {
     const cfg = loadCfg();
     if (!cfg.url || !cfg.key) {
         if (!settingsOpen) toggleSettings();
@@ -5052,6 +5082,10 @@ async function generate(ctx, userName, charName, perspective = 'user', signal = 
     const prompt = appendTravelPromptContext(buildPrompt(userName, charName, perspective, pinned, loadCalDesc(), { mode: adultMode, tickets: pointTicketPlan(adultMode, 14) }), travelContext);
     const apiOpts = { ...(travelContext?.feedback === 'time-travel' ? { fullMemory: true, ...travelContext } : (travelContext || {})), promptMode: 'creative', diagnosticModule: 'point', diagnosticSink };
     apiOpts.pointView = perspective;
+    if (memoryContext?.memorySnapshot) {
+        apiOpts.memorySnapshot = memoryContext.memorySnapshot;
+        apiOpts.memoryOperationToken = memoryContext.memoryOperationToken;
+    }
     return callCustomApi(ctx, prompt, cfg, userName, charName, signal, 3, apiOpts);
 }
 
@@ -5488,11 +5522,8 @@ async function buildRecentChatContext(ctx, floorCount = 6, perMessageChars = 250
     const charName = ctx.name2 || '角色';
     const s = getSettings();
     const stripOpts = { keepTags: s.keepTags, extraTags: s.extraTags };
-    // Walk from the end backwards, collect up to N visible AI entries.
     const rows = [];
-    for (let i = chat.length - 1; i >= 0 && rows.length < floorCount; i--) {
-        const m = chat[i];
-        if (!m || m.is_user || m.is_system) continue;   // only visible AI narrative
+    for (const m of selectVisibleChatHistory(chat, floorCount)) {
         const raw = String(m.mes || '');
         if (!raw.trim()) continue;
         const cleaned = memory.stripTags(raw, stripOpts).trim();
@@ -5501,7 +5532,7 @@ async function buildRecentChatContext(ctx, floorCount = 6, perMessageChars = 250
         const capped = cleaned.length > perMessageChars
             ? cleaned.slice(0, perMessageChars) + '…'
             : cleaned;
-        rows.unshift(`【${speaker}】${capped}`);
+        rows.push(`【${speaker}】${capped}`);
     }
     if (!rows.length) return '';
     return `【最近对话】以下是主聊天中最近几层对话原文，供理解当前剧情走向。\n\n${rows.join('\n\n')}`;
@@ -5554,13 +5585,10 @@ function worldInfoActivationEntries(result, mode) {
     const entries = mode === 'luker' ? result.activatedEntries : result.allActivatedEntries;
     if (mode === 'luker') {
         if (!Array.isArray(entries)) return null;
-        if (entries.some(entry => !entry || typeof entry !== 'object' || !worldInfoCandidateKey(entry.world, entry.uid))) return null;
-        return entries;
+        return entries.filter(entry => entry && typeof entry === 'object' && worldInfoCandidateKey(entry.world, entry.uid));
     }
     if (!(entries instanceof Set)) return null;
-    const values = [...entries];
-    if (values.some(entry => !entry || typeof entry !== 'object' || !worldInfoCandidateKey(entry.world, entry.uid))) return null;
-    return values;
+    return [...entries].filter(entry => entry && typeof entry === 'object' && worldInfoCandidateKey(entry.world, entry.uid));
 }
 
 const WORLD_INFO_TOKEN_BUDGET = 60000;
@@ -5730,7 +5758,7 @@ function animaTextTokens(text) {
 }
 function buildAnimaRecallQuery(explicitQuery = '') {
     const ctx = getContext();
-    const recent = Array.isArray(ctx?.chat) ? ctx.chat.filter(m => !m?.is_user && !m?.is_system).slice(-6) : [];
+    const recent = selectVisibleChatHistory(ctx?.chat, 6);
     const s = getSettings();
     const tail = recent.map(m => memory.stripTags(String(m?.mes || ''), { keepTags: s.keepTags, extraTags: s.extraTags }).slice(-700)).join('\n');
     return `${explicitQuery}\n${tail}`.slice(-6000);
@@ -5891,8 +5919,8 @@ async function _getMemTextRaw(opts = {}) {
 // 柏宝书注入版靠向量召回自封顶，但 Anima 全量拼分片、内置 L1 早期章节全塞，长故事会飙到 10w+ tk。
 //   full=true（历·排全年日期）→ 保覆盖：跨全程等距抽块，别掐中段（会漏中段生日/纪念日）。
 //   full=false（点/线/面/间）→ 近景优先：留最近的块 + 一小段最早梗概，中段省略。
-// 不超预算 → 原样返回、零改动。按空行块边界切（三源都用 '\n\n' 分语义单元），不切碎句子。
-// token 用一次精确总数反推「每字 token 比」再按块长比例分摊，避免逐块调分词器。滚动再压是 v2。
+// 不超预算 → 原样返回、零改动。按空行块边界切（三源都用 '\n\n' 分语义单元）；遇到单个超大块时会按策略截取首部或尾部。
+// token 用一次精确总数反推「每字 token 比」，并按实际选中的块、分隔符与省略提示累计估算，避免逐块调分词器。
 async function getMemText(opts = {}) {
     const raw = await _getMemTextRaw(opts);
     try { return await _capMemText(raw, !!opts.full); }
@@ -5917,39 +5945,70 @@ async function _capMemText(text, full) {
         const keepChars = Math.max(1, Math.floor(eff / ratio));
         return full ? t.slice(0, keepChars) : t.slice(-keepChars);
     }
-    const tok = b => Math.max(1, Math.round(b.length * ratio));
+    const tok = b => b ? Math.max(1, Math.ceil(b.length * ratio)) : 0;
+    const SEP = '\n\n';
+    const sepCost = tok(SEP);
+    const sliceWithin = (value, allowance, fromEnd = false) => {
+        if (allowance <= 0) return '';
+        if (tok(value) <= allowance) return value;
+        const chars = Math.max(1, Math.floor(allowance / ratio));
+        let part = fromEnd ? value.slice(-chars) : value.slice(0, chars);
+        while (part.length > 1 && tok(part) > allowance) part = fromEnd ? part.slice(1) : part.slice(0, -1);
+        return tok(part) <= allowance ? part : '';
+    };
     if (full) {
-        // 历·保覆盖：等距抽块塞满预算，含首尾，中段均匀留样本——绝不整段掐掉（那会漏中段纪念日）。
+        // 历·保覆盖：等距抽块，含首尾与中段。每个样本按剩余样本数公平分配，超大首块不会吞掉后续覆盖。
         const avg = total / blocks.length;
-        const keep = Math.max(1, Math.floor(eff / Math.max(1, avg)));
-        if (keep >= blocks.length) return t;
-        const step = blocks.length / keep;
+        const keep = Math.min(blocks.length, Math.max(Math.min(3, blocks.length), Math.floor(eff / Math.max(1, avg))));
         const idxs = [];
         for (let k = 0; k < keep; k++) {
-            const idx = Math.min(blocks.length - 1, Math.round(k * step));
+            const idx = keep === 1 ? 0 : Math.round(k * (blocks.length - 1) / (keep - 1));
             if (idxs[idxs.length - 1] !== idx) idxs.push(idx);
         }
-        if (idxs[idxs.length - 1] !== blocks.length - 1) idxs.push(blocks.length - 1);
-        return ['（……为控制长度，以下为全程等距节选，非完整时间线……）', ...idxs.map(i => blocks[i])].join('\n\n');
+        const parts = ['（……为控制长度，以下为全程等距节选，非完整时间线……）'];
+        let used = tok(parts[0]);
+        for (let pos = 0; pos < idxs.length; pos++) {
+            const remaining = idxs.length - pos;
+            const allowance = Math.floor((eff - used - sepCost * remaining) / remaining);
+            const part = sliceWithin(blocks[idxs[pos]], allowance);
+            if (!part) continue;
+            parts.push(part);
+            used += sepCost + tok(part);
+        }
+        return parts.join(SEP);
     }
     // 点/线/面/间·近景优先：最早留一小段梗概（≤15% 预算）+ 最近塞满剩余，中段省略。
     const ELIDE = '（……中段记忆已省略以控制长度……）';
     const headBudget = Math.floor(eff * 0.15);
-    const head = []; let hUsed = 0, hi = 0;
-    while (hi < blocks.length && hUsed + tok(blocks[hi]) <= headBudget) { head.push(blocks[hi]); hUsed += tok(blocks[hi]); hi++; }
-    const tailBudget = eff - hUsed - tok(ELIDE);
-    const tailRev = []; let tUsed = 0, ti = blocks.length - 1;
-    while (ti >= hi && tUsed + tok(blocks[ti]) <= tailBudget) { tailRev.push(blocks[ti]); tUsed += tok(blocks[ti]); ti--; }
-    const tail = tailRev.reverse();
-    if (head.length + tail.length === 0) {                 // 极端：块都比预算大 → 退回按字截最近一段
-        const keepChars = Math.max(1, Math.floor(eff / ratio));
-        return t.slice(-keepChars);
+    const head = []; let hUsed = 0, hi = 0, headTruncated = false;
+    // 最新块永远交给尾部预算，从块尾截取；早期预算不能先从它的开头切走。
+    while (hi < blocks.length - 1) {
+        const allowance = headBudget - hUsed - (head.length ? sepCost : 0);
+        const part = sliceWithin(blocks[hi], allowance);
+        if (!part) break;
+        head.push(part);
+        hUsed += (head.length > 1 ? sepCost : 0) + tok(part);
+        hi++;
+        if (part.length < blocks[hi - 1].length) { headTruncated = true; break; }
     }
+    const fixedCost = hUsed + tok(ELIDE) + sepCost * (head.length ? 2 : 1);
+    const tailBudget = Math.max(0, eff - fixedCost);
+    const tailRev = []; let tUsed = 0, ti = blocks.length - 1, tailTruncated = false;
+    while (ti >= hi) {
+        const allowance = tailBudget - tUsed - (tailRev.length ? sepCost : 0);
+        const part = sliceWithin(blocks[ti], allowance, ti === blocks.length - 1);
+        if (!part) break;
+        tailRev.push(part);
+        tUsed += (tailRev.length > 1 ? sepCost : 0) + tok(part);
+        ti--;
+        if (part.length < blocks[ti + 1].length) { tailTruncated = true; break; }
+    }
+    const tail = tailRev.reverse();
     const parts = [];
     if (head.length) parts.push(...head);
-    if (hi <= ti) parts.push(ELIDE);                       // 中段确有被跳过的块才插省略标记
+    if (hi <= ti || headTruncated || tailTruncated) parts.push(ELIDE);
     if (tail.length) parts.push(...tail);
-    return parts.join('\n\n');
+    return parts.join(SEP);
 }
 
 // user persona 描述 + 当前聊天的作者注释——点/线/面生成与间/面聊天共用同一读取口径。
@@ -5972,7 +6031,17 @@ async function buildMessages(ctx, prompt, userName, charName, historyLimit = 3, 
     const authorNote = rawAuthorNote;
 
     // Story memory (Plan C: objective memory + view tag)
-    const rawMemText = await getMemText({ full: opts.fullMemory, query: prompt });
+    const hasMemorySnapshot = Object.prototype.hasOwnProperty.call(opts, 'memorySnapshot');
+    let rawMemText;
+    if (hasMemorySnapshot) {
+        const snapshot = opts.memorySnapshot;
+        if (!qianQianJieGenerationSnapshotCurrent(snapshot, opts.memoryOperationToken, ctx)) throw makeDiagnosticError('memory-stale', { phase: 'memory-preflight' });
+        const rawSnapshotText = snapshot.text;
+        try { rawMemText = await _capMemText(rawSnapshotText, !!opts.fullMemory); }
+        catch (err) { console.warn('[7dayscal] 记忆预算封顶出错，回退原文', safeDiagnosticLog('memory', 'request', err, { background: true })); rawMemText = rawSnapshotText; }
+    } else {
+        rawMemText = await getMemText({ full: opts.fullMemory, query: prompt });
+    }
     const memText = sanitizeGenerationContextText(rawMemText, { reroll: opts.reroll });
     const memPerspective = opts.pointView === 'char' ? charName : opts.pointView === 'user' ? userName : null;
     const memBlock = memText
@@ -7517,6 +7586,7 @@ function bindTheaterHandlers() {
 function bindMemoryHandlers() {
     $in('#sp-mem-source-qqj').on('change', function () {
         const s = getSettings();
+        memorySourceEpoch += 1;
         s.useQianQianJie = this.checked;
         if (this.checked) { s.useBaiBaiBook = false; s.useAnima = false; s.useDatabase = false; }
         saveSettingsDebounced();
@@ -7525,6 +7595,7 @@ function bindMemoryHandlers() {
     });
     $in('#sp-mem-source-bbb').on('change', function () {
         const s = getSettings();
+        memorySourceEpoch += 1;
         s.useBaiBaiBook = this.checked;
         if (this.checked) { s.useAnima = false; s.useDatabase = false; s.useQianQianJie = false; }   // 记忆源互斥
         saveSettingsDebounced();
@@ -7533,6 +7604,7 @@ function bindMemoryHandlers() {
     });
     $in('#sp-mem-source-anima').on('change', function () {
         const s = getSettings();
+        memorySourceEpoch += 1;
         s.useAnima = this.checked;
         if (this.checked) { s.useBaiBaiBook = false; s.useDatabase = false; s.useQianQianJie = false; }   // 记忆源互斥
         saveSettingsDebounced();
@@ -7541,6 +7613,7 @@ function bindMemoryHandlers() {
     });
     $in('#sp-mem-source-database').on('change', function () {
         const s = getSettings();
+        memorySourceEpoch += 1;
         s.useDatabase = this.checked;
         if (this.checked) { s.useBaiBaiBook = false; s.useAnima = false; s.useQianQianJie = false; }
         saveSettingsDebounced();
@@ -7578,7 +7651,8 @@ function bindMemoryHandlers() {
         saveSettingsDebounced();
     });
     $in('#sp-mem-skipshort').on('change', function () {
-        const v = Math.max(0, Math.min(500, parseInt(this.value, 10) || 50));
+        const parsed = parseInt(this.value, 10);
+        const v = Math.max(0, Math.min(500, Number.isNaN(parsed) ? 50 : parsed));
         getSettings().memorySkipShort = v;
         this.value = v;
         saveSettingsDebounced();
