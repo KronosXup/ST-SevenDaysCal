@@ -39,7 +39,8 @@ import {
 import { escapeHtml, escapeAttr, autoGrowTextarea, cleanText } from './utils/dom.js';
 import { _cnToNumber, _CN_MONTH_ALIAS, extractDayFromTime } from './utils/cn-date.js';
 import { weatherGlyph, maskKey } from './utils/format.js';
-import { getSettings, parseExcludeParams, loadCfg, loadUtilityCfg, saveCfg, loadApiPresets, upsertApiPreset, deleteApiPreset, renameApiPreset, fabEnabled, pluginEnabled, injectEnabled, getLinesInterval, saveLinesInterval, getLinesMode, saveLinesMode } from './runtime/settings.js';
+import { getSettings, parseExcludeParams, loadCfg, loadUtilityCfg, saveCfg, loadApiPresets, upsertApiPreset, deleteApiPreset, renameApiPreset, fabEnabled, getLinesInterval, saveLinesInterval, getLinesMode, saveLinesMode } from './runtime/settings.js';
+import { characterCardMatches, effectivePluginEnabled, excludedCharacterSet, isCharacterExcluded, renderCharacterExclusionRows, setCharacterExcluded as updateCharacterExcluded } from './runtime/character-exclusion.js';
 import { postChatCompletion, callCustomApi, callMemoryApi, callTheaterApi, bindApiClient, GEN_TEMPERATURE } from './api/client.js';
 import { normalizeApiUrl } from './api/sse.js';
 import { safeDiagnosticLog, diagnosticMessage, makeDiagnosticError, shouldNotifyGeneration, classifyGenerationError } from './api/diagnostics.js';
@@ -415,6 +416,7 @@ const axisDateActions = createAxisDateActions({
 
 // 绑定 API 网络层所需的 UI/业务回调（避免 api/client.js 反向依赖 index.js 造成循环引用）。
 bindApiClient({
+    enabled: pluginEnabled,
     setFabBusy,
     setLastDebugPayload: (v) => { lastDebugPayload = v; },
     buildMessages,
@@ -615,7 +617,9 @@ const reconcileLedgerSources = async (owner = null) => {
     try { return await ledger.reconcileEntriesAtomic(sources, getContext()?.chat?.length || 0, owner); }
     catch (error) { logSourceError(error, error.planSummary); return { changed: false, summary: error.planSummary || {}, phase: error.phase || 'source-save-failed', error }; }
 };
-const runLedgerCaptureStep = (manual = false, travelContext = null) => ledgerCaptureController.run(manual, travelContext);
+const runLedgerCaptureStep = (manual = false, travelContext = null) => pluginEnabled()
+    ? ledgerCaptureController.run(manual, travelContext)
+    : Promise.resolve({ status: 'skipped', reason: 'plugin-disabled' });
 const ledgerInjectionController = createLedgerInjectionController({
     context: getContext,
     enabled: injectEnabled,
@@ -659,7 +663,9 @@ const ledgerJudgeController = createLedgerJudgeController({
     refreshInline: refreshInlineWindow,
     render: () => { if (axisState.almanacMode && axisState._almanacSheet === 'ledger') renderAlmanacPanel(); },
 });
-const runLedgerJudgeStep = (manual = false, travelContext = null) => ledgerJudgeController.run(manual, travelContext);
+const runLedgerJudgeStep = (manual = false, travelContext = null) => pluginEnabled()
+    ? ledgerJudgeController.run(manual, travelContext)
+    : Promise.resolve({ status: 'skipped', reason: 'plugin-disabled' });
 const ledgerInlineRenderer = createLedgerInlineRenderer({
     settings: getSettings,
     calendar: loadCalDesc,
@@ -1865,7 +1871,7 @@ export function parseFontFamilyFromCss(cssText) {
 }
 
 jQuery(async () => {
-    const initialStorageLoad = loadExternalChat({ force: true });
+    const initialStorageLoad = currentCharacterExcluded() ? Promise.resolve() : loadExternalChat({ force: true });
     if (isExternalMode()) await initialStorageLoad;
     // 界面字号缩放：把持久化的 uiScale 写进 --sp-scale，令牌即刻按此缩放（早于注入 UI，防首帧闪错号）
     document.documentElement.style.setProperty('--sp-scale', String(Number(getSettings().uiScale) || 1));
@@ -1885,7 +1891,7 @@ jQuery(async () => {
         getSettings: () => {
             const s = getSettings();
             return {
-                pluginEnabled  : s.pluginEnabled !== false,
+                pluginEnabled  : pluginEnabled(),
                 useBaiBaiBook  : !!s.useBaiBaiBook,
                 useAnima       : !!s.useAnima,
                 useDatabase    : !!s.useDatabase,
@@ -1927,7 +1933,7 @@ jQuery(async () => {
     coordinateRuntime.feature.bindUi($in('#sp-anchor-wrap')?.[0] || null);
     coordinateRuntime.feature.bindDelete($in('#sp-anchor-wrap')?.[0] || null);
     coordinateRuntime.feature.bindGestures($in('#sp-anchor-wrap')?.[0] || null);
-    coordinateRuntime.feature.refreshSavedKeys();
+    if (pluginEnabled()) coordinateRuntime.feature.refreshSavedKeys();
     activeChatBoundaryIdentity = captureChatBoundary();
     setTimeout(() => coordinateRuntime.feature.scanButtons(), 900);
     initChatObserver();
@@ -2003,6 +2009,11 @@ jQuery(async () => {
         axisCalendarManager.close();
         _lastMainView = 'schedule';
         coordinateRuntime?.feature?.onChatChanged({ chatId: getContext()?.chatId ?? null, chatMetadataRef: getContext()?.chatMetadata ?? null, enabled: pluginEnabled() });
+        if (currentCharacterExcluded()) {
+            applyPluginEnabled(false, { characterExcluded: true });
+            ensureExcludedCharacterSettingsOnly();
+            return;
+        }
         const loadingChatId = String(getContext()?.chatId || '');
         await loadExternalChat({ force: true });
         if (String(getContext()?.chatId || '') !== loadingChatId) return;
@@ -2012,6 +2023,7 @@ jQuery(async () => {
         const _mig = store.migrateChatFromLocalStorage(getContext().chatId);
         // 插件总关只能截断新聊天初始化，不能截断上面的硬清场。
         if (!pluginEnabled()) { coordinateRuntime?.feature?.close?.(); return; }
+        $(`#${FAB_ID}`).css('display', fabEnabled() ? '' : 'none');
         coordinateRuntime?.feature?.close?.();
         $inAll('.sp-side-tab.sp-view-btn').removeClass('sp-view-active');
         $in('.sp-side-tab.sp-view-btn[data-view="schedule"]').addClass('sp-view-active');
@@ -2070,15 +2082,15 @@ jQuery(async () => {
         if (type) eventSource.on(type, _stListeners.newChatStorage);
     }
     if (_stListeners.diagnosticRetention) eventSource.removeListener?.(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.diagnosticRetention);
-    _stListeners.diagnosticRetention = () => refreshDiagnosticRetention(getContext());
+    _stListeners.diagnosticRetention = () => { if (!currentCharacterExcluded()) refreshDiagnosticRetention(getContext()); };
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, _stListeners.diagnosticRetention);
     if (_stListeners.externalSnapshotPrune) eventSource.removeListener?.(event_types.MESSAGE_DELETED, _stListeners.externalSnapshotPrune);
-    _stListeners.externalSnapshotPrune = () => { if (isExternalMode()) void pruneExternalSnapshots(getContext()?.chat || []); };
+    _stListeners.externalSnapshotPrune = () => { if (!currentCharacterExcluded() && isExternalMode()) void pruneExternalSnapshots(getContext()?.chat || []); };
     eventSource.on(event_types.MESSAGE_DELETED, _stListeners.externalSnapshotPrune);
     // 首屏补迁移：扩展初始化时当前 chat 往往已 ready（CHAT_CHANGED 早已错过），
     // 否则老用户要手动切一次 chat 才触发迁移。同步搬数据，冲突延后弹窗。
     try {
-        const _mig0 = store.migrateChatFromLocalStorage(getContext().chatId);
+        const _mig0 = currentCharacterExcluded() ? { status: 'skipped' } : store.migrateChatFromLocalStorage(getContext().chatId);
         if (_mig0.status === 'conflict') scheduleForChatBoundary(() => showStoreConflictDialog(_mig0), 900);
         if (pluginEnabled()) maybeApplyBoundCalendarTemplate().catch(error => {
             console.error('[SP calendar] 首屏角色默认历法自动应用失败', safeDiagnosticLog('axis', 'save', error));
@@ -2326,7 +2338,7 @@ jQuery(async () => {
     _themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
     // 首屏落地插件总开关：若加载时已是关闭态，藏球 / 清块 / 断后台 / 撤注入（各首屏挂载虽已被 pluginEnabled 闸挡，
     // 这里兜底把已挂的悬浮球藏掉、把注入清干净）。开启态无需动——上面各首屏路径已正常挂载。
-    if (!pluginEnabled()) applyPluginEnabled(false);
+    if (!pluginEnabled()) applyPluginEnabled(false, { characterExcluded: currentCharacterExcluded() });
 });
 // ─── Config helpers ───────────────────────────────────────────────────────────
 
@@ -2354,11 +2366,14 @@ jQuery(async () => {
 
 
 // ─── 插件总开关（③）───────────────────────────────────────────────────────────
-// pluginEnabled 关 = 全隐身；injectEnabled 关 = 掐线/面/刻度潜伏注入（受 pluginEnabled 统辖）。
+// 运行态总闸 = 用户的全局开关 × 当前单聊角色卡未被排除。排除不改写原设置；群聊保持原行为。
+function currentCharacterExcluded(ctx = getContext()) { return isCharacterExcluded(ctx, getSettings()); }
+function pluginEnabled() { return effectivePluginEnabled(getContext(), getSettings()); }
+function injectEnabled() { return pluginEnabled() && getSettings().injectEnabled !== false; }
 
 // 一键中断所有在飞的后台判定与生成（各域 controller 及日期检测/点后台任务），并清 re-entry 闸，
 // 让重新开启后能干净重跑。照 CHAT_CHANGED 的中断序列集中一处。
-function _abortAllBackground() {
+function _abortAllBackground({ abortStorageMigration = false } = {}) {
     const ctx = getContext?.() || {};
     traceDiagnosticEvent('abort-boundary', { module: 'runtime', chatId: ctx.chatId ?? null, chatRevision: pointTaskOwners.currentChatRevision(), boundaryEpoch: chatBoundaryEpoch, abortReason: 'plugin-disabled', status: 'dispatch' });
     memory.abortAll('plugin-disabled');
@@ -2366,7 +2381,9 @@ function _abortAllBackground() {
     if (activeTravel) clearTimeTravelSession(activeTravel, { removeWaitingBlock: activeTravel.phase === 'waiting', reason: 'plugin-disabled' });
     _timeTravelSelectionSeq++;
     _activeTimeTravelSelection = null;
+    _activeSpConfirmCancel?.();
     customDialog.cancelActive();
+    if (abortStorageMigration) { try { abortMigration(); } catch {} }
     linesFeature.abortGeneration({ reason: 'plugin-disabled' });
     for (const c of [
         linesFeature.runtime.controller,
@@ -2417,7 +2434,7 @@ function abortPortableImportTasks(reason = 'portable-import') {
 // 插件总开关落地。关：藏悬浮球、清所有楼内块与坐标入口（由各 feature 内部闸兜底）、
 // 断所有后台任务、撤各域潜伏注入。不关面板——用户往往正站在设置里切它，留着好即时切回。
 // 开：按各子开关恢复——显示悬浮球、重挂楼内块与线/面/故事时钟/刻度注入、补锚点入口。事件监听不注销，靠各 listener 的 pluginEnabled() 闸空转。
-function applyPluginEnabled(on) {
+function applyPluginEnabled(on, { characterExcluded = false } = {}) {
     const ctx = getContext();
     if (on) {
         if (theaterMode) theaterFeature.open();
@@ -2434,7 +2451,7 @@ function applyPluginEnabled(on) {
         try { coordinateRuntime?.feature?.close?.(); } catch {}
         $(`#${FAB_ID}`).css('display', 'none');
         try { _clearAllInlineBoxes(); } catch {}
-        _abortAllBackground();
+        _abortAllBackground({ abortStorageMigration: characterExcluded });
         try { ctx.setExtensionPrompt?.(LINES_INJECT_KEY, ''); } catch {}
         try { outlineFeature.injection.clear(); } catch {}
         try { ledgerInjectionController.clear(); } catch {}
@@ -2772,7 +2789,7 @@ function injectFab() {
     const posStyle = (!mobile && savedPos)
         ? `left:${savedPos.left}px;top:${savedPos.top}px;right:auto;bottom:auto;`
         : '';
-    const html = `<div id="${FAB_ID}" style="position:fixed;z-index:2000000;${posStyle}${fabEnabled() ? '' : 'display:none'}">
+    const html = `<div id="${FAB_ID}" style="position:fixed;z-index:2000000;${posStyle}${fabEnabled() && pluginEnabled() ? '' : 'display:none'}">
         <button class="sp-fab-btn sp-${currentTheme}" title="构画"
             style="transform:translateZ(0);clip:auto;">
             ${PEN_ICON_SVG}
@@ -3051,6 +3068,25 @@ function injectModal() {
                             </details>
 
                             <!-- 全局设置 2：世界书 -->
+                            <details class="sp-settings-section" id="sp-character-exclude-section">
+                                <summary class="sp-settings-section-title">角色卡</summary>
+                                <div class="sp-settings-section-body">
+                                    <details class="sp-wi-exclude-drawer">
+                                        <summary class="sp-wi-exclude-drawer-head">
+                                            <span class="sp-wi-exclude-drawer-title">全局排除</span>
+                                            <span id="sp-character-exclude-count" class="sp-wi-exclude-drawer-count"></span>
+                                        </summary>
+                                        <div class="sp-wi-exclude-drawer-body">
+                                            <p class="sp-cfg-hint">勾选的角色卡会在其所有<strong>单人聊天</strong>里完全停用构画，只保留设置入口。旧的点、线、面、记忆等数据原样保留；取消勾选后恢复。群聊不受影响。</p>
+                                            <input type="text" id="sp-character-exclude-search" class="sp-input sp-wi-exclude-search" placeholder="查找角色卡名或文件名…" autocomplete="off">
+                                            <div id="sp-character-exclude-list" class="sp-wi-exclude-list">
+                                                <span class="sp-cfg-hint">（打开设置时自动加载）</span>
+                                            </div>
+                                        </div>
+                                    </details>
+                                </div>
+                            </details>
+
                             <details class="sp-settings-section" id="sp-wi-section">
                                 <summary class="sp-settings-section-title">世界书</summary>
                                 <div class="sp-settings-section-body" id="sp-wi-body">
@@ -3553,6 +3589,17 @@ function injectModal() {
 
     if (cfg.key) $in('#sp-cfg-key').val(maskKey(cfg.key)).data('real', cfg.key);
 
+    // 排除卡只允许操作设置；捕获阶段拦下残留业务 DOM，避免任何旧页面按钮先于委托门控执行。
+    _spShadow.addEventListener('click', event => {
+        if (!currentCharacterExcluded()) return;
+        const target = (event.composedPath?.() || []).find(node => node instanceof Element) || event.target;
+        const allowed = target?.closest?.('#sp-settings-overlay, .sp-settings-btn, .sp-close-btn');
+        if (allowed) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        ensureExcludedCharacterSettingsOnly();
+    }, true);
+
     $in('.sp-close-btn').on('click',    closePanel);
     $in('.sp-settings-btn').on('click', toggleSettings);
     $in('.sp-settings-close-btn').on('click', toggleSettings);
@@ -3566,7 +3613,7 @@ function injectModal() {
         const nowEnabled = !fabEnabled();
         getSettings().fabShow = nowEnabled;
         saveSettingsDebounced();
-        $(`#${FAB_ID}`).toggle(nowEnabled);
+        $(`#${FAB_ID}`).toggle(nowEnabled && pluginEnabled());
         $(this).toggleClass('sp-btn-active', nowEnabled);
     });
     $in('.sp-theme-toggle-btn').on('click', cycleThemeMode);
@@ -3988,6 +4035,7 @@ function injectModal() {
         // 仅「我/TA」子切换在点生成途中仍挡（点按视角生成，中途换视角无意义）。
         const view = $(this).data('view');
         if (!view) return;
+        if (currentCharacterExcluded()) { ensureExcludedCharacterSettingsOnly(); return; }
         $in('#sp-module-intro-pop').hide();   // 切模块即收起介绍气泡
 
         const $btn      = $(this);
@@ -4204,7 +4252,7 @@ function injectModal() {
     $in('#sp-plugin-enabled').on('change', function () {
         getSettings().pluginEnabled = this.checked;
         stSaveSettings();
-        applyPluginEnabled(this.checked);
+        applyPluginEnabled(pluginEnabled(), { characterExcluded: currentCharacterExcluded() });
     });
     // 潜伏注入总闸：立刻生效——重设线 / 面 / 暗历三路注入（关时内部各自清空）。
     $in('#sp-inject-enabled').on('change', function () {
@@ -4244,6 +4292,7 @@ function injectModal() {
     $in('#sp-adult-blur-enabled').on('change', function () {
         getSettings().adultBlurEnabled = this.checked;
         saveSettingsDebounced();
+        if (!pluginEnabled()) return;
         if (linesMode) linesFeature.refreshPanel();
         if (!outlineMode && !linesMode && !spaceMode) {
             const saved = readStore(getCacheKey(currentView, charViewName));
@@ -4290,6 +4339,7 @@ function injectModal() {
     $in('#sp-dashed-enabled').on('change', function () {
         getSettings().dashedEnabled = this.checked;
         saveSettingsDebounced();
+        if (!pluginEnabled()) return;
         if (linesMode) linesFeature.refreshPanel();
         syncLatestInlineBlock();
     });
@@ -4297,14 +4347,14 @@ function injectModal() {
         getSettings().dashedCleanupEnabled = this.checked;
         $in('#sp-dashed-keep-count').prop('disabled', !this.checked);
         saveSettingsDebounced();
-        if (this.checked) linesFeature.dashed.cleanup(true);
+        if (this.checked && pluginEnabled()) linesFeature.dashed.cleanup(true);
     });
     $in('#sp-dashed-keep-count').on('change', function () {
         const count = linesFeature.dashed.normalizeKeepCount(this.value);
         getSettings().dashedKeepCount = count;
         this.value = String(count);
         saveSettingsDebounced();
-        if (getSettings().dashedCleanupEnabled !== false) linesFeature.dashed.cleanup(true);
+        if (getSettings().dashedCleanupEnabled !== false && pluginEnabled()) linesFeature.dashed.cleanup(true);
     });
     // 大纲自动注入（面）开关：on → 按当前大纲+游标立即注入；off → 清空扩展 prompt（游标留 chat_metadata，再开即续）
     $in('#sp-outline-inject').on('change', function () {
@@ -4730,6 +4780,10 @@ function resetPanelToScheduleHome() {
 }
 function openSchedule() {
     showPanel();
+    if (currentCharacterExcluded()) {
+        ensureExcludedCharacterSettingsOnly();
+        return;
+    }
     resetPanelToScheduleHome();   // 先归位到点首页（清所有子视图 mode/wrap），作为恢复的干净基线
     // 同 chat 内恢复上次打开的模块视图；切 chat 已把 _lastMainView 复位成 schedule → 默认第一页。
     // 非 schedule：触发该 tab 的 click 让它自渲染（此刻各 mode 均 false，不会被幂等 guard 挡）。
@@ -4768,6 +4822,9 @@ function showPanel() {
     if (sheet) sheet.style.animation = '';
     $root.stop(true).css({ display: 'block', opacity: 0 })
          .animate({ opacity: 1 }, 180);
+    // 旧 toast / 后台完成回调也会直接 showPanel；统一在共同出口把排除卡导向设置，
+    // 避免 light DOM 入口绕过 shadow 内的业务点击捕获闸。
+    if (currentCharacterExcluded()) ensureExcludedCharacterSettingsOnly();
     setTimeout(() => {
         positionPanel();
         syncMobileViewport();
@@ -4789,6 +4846,12 @@ function closePanel() {
     });
 }
 
+function ensureExcludedCharacterSettingsOnly() {
+    if (!currentCharacterExcluded()) return false;
+    if ($(`#${MODAL_ID}`).is(':visible') && !settingsOpen) toggleSettings();
+    return true;
+}
+
 function setBody(html) { $in('#sp-body').html(html); }
 
 // ─── Memory pre-check helpers ─────────────────────────────────────────────────
@@ -4796,6 +4859,7 @@ function setBody(html) { $in('#sp-body').html(html); }
 // Called from CHAT_CHANGED and openSchedule so users see it on the next chat
 // switch OR the first time they open the panel post-upgrade.
 function checkMemoryMigrationNotice() {
+    if (currentCharacterExcluded()) return;
     const _ms = getSettings();
     if (_ms.useBaiBaiBook || _ms.useAnima || _ms.useDatabase || _ms.useQianQianJie) return;      // 外置记忆源不受内置记忆迁移影响
     const notice = memory.consumeMigrationNotice?.();
@@ -5103,6 +5167,36 @@ async function generate(ctx, userName, charName, perspective = 'user', signal = 
 function charStableKey(ctx) {
     const c = ctx?.characters?.[ctx?.characterId];
     return c?.avatar || null;   // 无角色（群聊/未选卡）→ null，各 getter 守卫返回默认
+}
+
+async function restoreCurrentCharacterAfterExclusion() {
+    const boundary = captureChatBoundary();
+    const loadingChatId = String(getContext()?.chatId || '');
+    await loadExternalChat({ force: true });
+    if (!isCurrentChatBoundary(boundary) || currentCharacterExcluded() || String(getContext()?.chatId || '') !== loadingChatId) return false;
+    const migration = store.migrateChatFromLocalStorage(getContext().chatId);
+    if (migration.status === 'conflict') scheduleForChatBoundary(() => showStoreConflictDialog(migration), 700);
+    pointState.cachedSchedule = loadCachedForCurrentChat();
+    applyPluginEnabled(pluginEnabled());
+    coordinateRuntime?.feature?.close?.();
+    $inAll('.sp-side-tab.sp-view-btn').removeClass('sp-view-active');
+    $in('.sp-side-tab.sp-view-btn[data-view="schedule"]').addClass('sp-view-active');
+    $inAll('.sp-sub-btn').removeClass('sp-view-active');
+    $in('.sp-sub-btn[data-view="user"]').addClass('sp-view-active');
+    $in('#sp-sub-toggle').show();
+    closeTaDrawer();
+    updateTaTriggerLabel();
+    $in('#sp-content-title').text('点');
+    $in('#sp-outline-wrap, #sp-lines-wrap, #sp-space-wrap, #sp-theater-wrap, #sp-anchor-wrap, #sp-almanac-wrap').hide();
+    $in('#sp-body').show();
+    $inAll('.sp-outline-btn').removeClass('sp-btn-active');
+    $in('#sp-chat-msgs, #sp-space-msgs').empty();
+    if (pointState.cachedSchedule) setBody(pointState.cachedSchedule);
+    else setBody(`<div class="sp-empty"><i class="fa-regular fa-calendar"></i><p>还没有点</p><button class="sp-gen-btn" id="sp-gen-schedule-now">生成点</button></div>`);
+    void renderMemorySection();
+    void renderStorageUsage();
+    void renderCurrentChatStorageMode();
+    return true;
 }
 
 function getLegacyWiFilter() {
@@ -6364,13 +6458,14 @@ async function routeChatStorageToAvailableBackend(identity) {
 }
 
 async function handleNewChatStorage() {
+    if (currentCharacterExcluded()) return { mode: 'blocked', result: { ok: false, reason: 'character-excluded' } };
     const boundary = captureChatBoundary();
     const identity = storageChatIdentity();
     if (!identity || !isCurrentChatBoundary(boundary)) return { mode: 'blocked', result: { ok: false, reason: 'missing-chat' } };
     if (sameStorageChatIdentity(newChatStorageAttempt?.identity, identity)) return newChatStorageAttempt.task;
     const task = (async () => {
         const routed = await routeChatStorageToAvailableBackend(identity);
-        if (!storageChatStillCurrent(identity) || !isCurrentChatBoundary(boundary)) return { mode: 'blocked', result: { ...routed.result, ok: false, reason: 'chat-changed' } };
+        if (currentCharacterExcluded() || !storageChatStillCurrent(identity) || !isCurrentChatBoundary(boundary)) return { mode: 'blocked', result: { ...routed.result, ok: false, reason: currentCharacterExcluded() ? 'character-excluded' : 'chat-changed' } };
         if (routed.mode === 'external') {
             void renderStorageUsage(); void renderCurrentChatStorageMode();
         } else if (routed.mode === 'unknown') {
@@ -6400,6 +6495,10 @@ async function renderCurrentChatStorageMode() {
     const $retry = $in('#sp-storage-retry');
     if (!$status.length) return;
     $migrate.prop('hidden', true); $retry.prop('hidden', true);
+    if (currentCharacterExcluded()) {
+        $status.text('当前角色卡已排除；不会检测或切换这段单聊的构画存储位置。');
+        return;
+    }
     const state = storageStatus();
     if (!state.chatId) { $status.text('当前没有打开聊天。'); return; }
     if (state.busy) { $status.text('当前聊天的构画存储位置正在切换，请等待完成。'); return; }
@@ -6414,6 +6513,7 @@ async function renderCurrentChatStorageMode() {
     }
     $status.text('正在检测白鳥数据后端…');
     const probe = await probeExternalBackend();
+    if (currentCharacterExcluded()) return;
     if (storageStatus().chatId !== state.chatId || storageStatus().mode !== 'chat') return;
     if (probe.ok) {
         $status.text('当前仍随聊天文件存储。可主动把当前聊天的构画数据迁到白鳥数据后端；迁移前原聊天保持不变。');
@@ -6453,6 +6553,7 @@ function mountMigrationOverlay() {
 }
 
 async function startCurrentChatMigration() {
+    if (currentCharacterExcluded()) return;
     const initial = storageStatus();
     if (initial.busy) { showToast('当前聊天的构画存储位置正在切换，请等待完成', null, true); return; }
     if (!initial.chatId || initial.mode !== 'chat') return;
@@ -6494,6 +6595,7 @@ const portableSame = (left, right) => JSON.stringify(left) === JSON.stringify(ri
 let portableImportPickerIdentity = null;
 
 function portableStorageAvailable(actionLabel) {
+    if (currentCharacterExcluded()) return false;
     const state = storageStatus();
     if (!state.chatId) { showToast(`请先打开一个聊天，再${actionLabel}`, null, true); return false; }
     if (state.busy) { showToast(`当前聊天的构画存储位置正在切换，请等待完成后再${actionLabel}`, null, true); return false; }
@@ -6785,6 +6887,7 @@ async function importPortableFile(file, identity) {
 }
 
 async function exportCurrentChatDiagnosticPackage() {
+    if (currentCharacterExcluded()) return;
     const choice = await customDialog.choose({
         title: '导出当前聊天诊断包',
         body: '诊断包会包含最近两个有效 AI 楼的请求记录（每个模块仅保留最新一次），包括完整输入与原始回复，可能含剧情。默认不附带聊天正文，也绝不导出 API 配置、URL、密码、请求头或其它聊天。',
@@ -6807,6 +6910,11 @@ async function exportCurrentChatDiagnosticPackage() {
 async function renderStorageUsage() {
     const $body = $in('#sp-storage-body');
     if (!$body.length) return;
+    if (currentCharacterExcluded()) {
+        $body.html('<div class="sp-cfg-hint" style="padding:4px 0">当前角色卡已排除；不会读取或改动这段单聊的构画数据。</div>');
+        $in('#sp-storage-migrate, #sp-storage-retry').prop('hidden', true);
+        return;
+    }
     const fmt = store.formatBytes;
     void renderCurrentChatStorageMode();
 
@@ -6977,10 +7085,11 @@ function refreshEditorsFromCurrentStore(kind) {
 
 // 绑定存储管理面板的清理按钮（委托到 #sp-storage-body，内容动态渲染）+ 刷新。
 function bindStorageHandlers() {
-    $in('#sp-storage-refresh').on('click', () => renderStorageUsage());
-    $in('#sp-storage-migrate').on('click', () => { void startCurrentChatMigration(); });
-    $in('#sp-storage-portable-export').on('click', () => { void exportPortableModules(); });
+    $in('#sp-storage-refresh').on('click', () => { if (!currentCharacterExcluded()) void renderStorageUsage(); });
+    $in('#sp-storage-migrate').on('click', () => { if (!currentCharacterExcluded()) void startCurrentChatMigration(); });
+    $in('#sp-storage-portable-export').on('click', () => { if (!currentCharacterExcluded()) void exportPortableModules(); });
     $in('#sp-storage-portable-import').on('click', () => {
+        if (currentCharacterExcluded()) return;
         if (!portableStorageAvailable('导入数据')) return;
         portableImportPickerIdentity = storageChatIdentity();
         const input = inEl('#sp-storage-portable-file');
@@ -6993,9 +7102,10 @@ function bindStorageHandlers() {
         portableImportPickerIdentity = null;
         const file = this.files?.[0] || null;
         this.value = '';
-        if (file) void importPortableFile(file, identity);
+        if (file && !currentCharacterExcluded()) void importPortableFile(file, identity);
     });
     $in('#sp-storage-retry').on('click', async () => {
+        if (currentCharacterExcluded()) return;
         const before = storageStatus().chatId;
         await loadExternalChat({ force: true });
         if (storageStatus().chatId !== before) return;
@@ -7007,6 +7117,7 @@ function bindStorageHandlers() {
 
     // 日历条目必须按精确 dataKey 删除，不能调用按 kind 前缀的清理。
     $body.on('click', '.sp-storage-del[data-scope="datakey"]', async function () {
+        if (currentCharacterExcluded()) return;
         const dataKey = $(this).attr('data-key');
         if (!store.isStorageDataKeyClearable(dataKey)) return;
         const identity = storageChatIdentity();
@@ -7030,6 +7141,7 @@ function bindStorageHandlers() {
 
     // ① 本聊天 chat_metadata —— 按 kind 清（点线面间讨论）
     $body.on('click', '.sp-storage-del[data-scope="kind"]', async function () {
+        if (currentCharacterExcluded()) return;
         const kind = $(this).attr('data-kind');
         if (kind === STORAGE_CLEAR_TARGETS.almanac.kind) return;
         const label = STORAGE_KIND_LABELS[kind] || kind;
@@ -7058,6 +7170,7 @@ function bindStorageHandlers() {
 
     // ① 本聊天 —— 清整个 own key（记忆 / 棱永久）
     $body.on('click', '.sp-storage-del[data-scope="ownkey"]', async function () {
+        if (currentCharacterExcluded()) return;
         const key = $(this).attr('data-key');
         const label = STORAGE_OWNKEY_LABELS[key] || key;
         if (!store.OWN_KEYS.includes(key)) return;
@@ -7100,6 +7213,7 @@ function bindStorageHandlers() {
 
     // ② 收藏（坐标·服务器）—— 清空全部
     $body.on('click', '.sp-storage-del[data-scope="anchor"]', async function () {
+        if (currentCharacterExcluded()) return;
         const cnt = await coordinateRuntime?.feature?.storageUsage?.().then(info => info.count).catch(() => 0);
         if (!cnt) { showToast('还没有任何收藏'); return; }
         if (!await spConfirm({ title: '清空全部收藏', body: `确定删除全部 ${cnt} 条收藏吗？此操作不可恢复（原楼层不受影响）。` })) return;
@@ -7115,6 +7229,7 @@ function bindStorageHandlers() {
 
     // ③ 本机缓存（localStorage：棱草稿 + UI 位置）
     $body.on('click', '.sp-storage-del[data-scope="local"]', async function () {
+        if (currentCharacterExcluded()) return;
         if (!await spConfirm({ title: '清理本机缓存', body: '清理本浏览器的棱草稿与界面位置（面板位置/大小）。不影响已存服务端的点线面间和收藏。确定？' })) return;
         const n = theaterDeviceCache.clearPluginCache();
         if (theaterMode) theaterFeature.resetAfterStorageClear();
@@ -7378,17 +7493,19 @@ function toggleSettings() {
         for (const value of ['turns', 'days', 'manual']) {
             $in(`input[name="sp-lines-mode"][value="${value}"]`).prop('checked', value === savedLinesMode);
         }
-        renderWiList();     // async, fire-and-forget — fills list when done
+        renderCharacterExcludeList();
+        if (!currentCharacterExcluded()) renderWiList();     // 排除卡不读取当前聊天关联世界书正文
         renderWiExcludeList();   // 全局排除清单（async fire-and-forget；冷缓存会强刷世界书全表）
         renderScaleRow();   // per-character scale radios (sync)
         renderAdultRow();
         renderMemorySection();   // memory status + settings sync
-        renderTheaterSection();  // 棱 settings + cache usage + template manager
+        renderTheaterSection();  // 棱设置；排除卡只同步全局提示词，不读聊天缓存
         renderStorageUsage();    // 存储管理面板：本聊天、坐标收藏、本机缓存三层用量统计
         $overlay.stop(true).css({ display: 'flex', opacity: 0 }).animate({ opacity: 1 }, 180);
     } else {
         $overlay.stop(true).animate({ opacity: 0 }, 150, function () { $(this).css('display', 'none'); });
         stSaveSettings();   // 关面板即把面板内所有改动立即写盘：兜底防抖未 flush 的字段（customPrompt 等），根治重启丢失
+        if (currentCharacterExcluded()) closePanel();
     }
     $in('.sp-settings-btn').toggleClass('sp-btn-active', settingsOpen);
     syncMobileViewport();
@@ -7446,6 +7563,16 @@ function renderMemorySection() {
     $in('#sp-custom-prompt').val(typeof s.customPrompt === 'string' ? s.customPrompt : '');
     $in('#sp-storyclock-prompt').val(buildStoryClockPrompt(s));
     $in('#sp-space-persona').val(typeof s.spacePersona === 'string' ? s.spacePersona : '');   // 间·人格覆盖：同为全局设置，须在按源 early-return 前回填
+    if (currentCharacterExcluded()) {
+        $in('#sp-mem-internal').show();
+        $in('#sp-mem-qqj-status, #sp-mem-bbb-status, #sp-mem-anima-status, #sp-mem-database-status').hide();
+        $in('#sp-mem-enabled').prop('checked', s.memoryEnabled !== false);
+        $in('#sp-mem-l0').val(Number.isFinite(+s.memoryL0Group) ? +s.memoryL0Group : 5);
+        $in('#sp-mem-l1').val(Number.isFinite(+s.memoryL1Group) ? +s.memoryL1Group : 10);
+        $in('#sp-mem-skipshort').val(Number.isFinite(+s.memorySkipShort) ? +s.memorySkipShort : 50);
+        $in('#sp-mem-status').html('<div class="sp-mem-alert sp-mem-alert-info">当前角色卡已排除；不会读取、补齐或重构这段单聊的记忆。</div>');
+        return;
+    }
     if (useQianQianJie) {
         $in('#sp-mem-internal').hide();
         $in('#sp-mem-bbb-status, #sp-mem-anima-status, #sp-mem-database-status').hide();
@@ -7520,6 +7647,7 @@ function renderMemorySection() {
 // source mid-await (re-checks useAnima before writing).
 async function renderAnimaStatus() {
     const $st = $in('#sp-mem-anima-status');
+    if (currentCharacterExcluded()) return;
     const th = globalThis.TavernHelper;
     if (!th || typeof th.getChatWorldbookName !== 'function' || typeof th.getWorldbook !== 'function') {
         $st.html('<i class="fa-solid fa-triangle-exclamation" style="color:#e0a54e"></i> 检测不到酒馆助手(TavernHelper)：请确认已安装并启用「酒馆助手」与「Anima 记忆系统」；点 / 线 / 面 / 间 生成时不会注入历史记忆');
@@ -7528,7 +7656,7 @@ async function renderAnimaStatus() {
     $st.html('<i class="fa-solid fa-spinner fa-spin"></i> 正在读取 Anima 摘要…');
     let wbName = null;
     try { wbName = await th.getChatWorldbookName('current'); } catch {}
-    if (!getSettings().useAnima) return;   // await 期间用户切走了源
+    if (currentCharacterExcluded() || !getSettings().useAnima) return;   // await 期间用户切走了源或排除了当前卡
     if (!wbName) {
         $st.html('<i class="fa-solid fa-triangle-exclamation" style="color:#e0a54e"></i> 当前聊天没有绑定世界书，读不到 Anima 摘要');
         return;
@@ -7542,7 +7670,7 @@ async function renderAnimaStatus() {
             }
         }
     } catch {}
-    if (!getSettings().useAnima) return;
+    if (currentCharacterExcluded() || !getSettings().useAnima) return;
     if (count > 0) {
         $st.html(`<i class="fa-solid fa-circle-check" style="color:var(--cardhub-accent,#7c9)"></i> Anima 已就绪（世界书「${escapeHtml(wbName)}」读到 ${count} 段摘要）`);
     } else {
@@ -7552,6 +7680,10 @@ async function renderAnimaStatus() {
 
 
 function refreshMemoryStatus() {
+    if (currentCharacterExcluded()) {
+        $in('#sp-mem-status').html('<div class="sp-mem-alert sp-mem-alert-info">当前角色卡已排除；不会读取、补齐或重构这段单聊的记忆。</div>');
+        return;
+    }
     const r = memory.getHealthReport();
     if (!r.paused) memoryPauseNoticeShown = false;
     const rows = [
@@ -7574,6 +7706,7 @@ function refreshMemoryStatus() {
 function renderTheaterSection() {
     const s = getSettings();
     $in('#sp-theater-style').val(typeof s.theaterStylePrompt === 'string' ? s.theaterStylePrompt : '');
+    if (currentCharacterExcluded()) return;
     void theaterFeature?.refreshUi();
 }
 
@@ -7725,10 +7858,12 @@ function bindMemoryHandlers() {
         try { showToast('已恢复内置默认（跟随插件更新）'); } catch {}
     });
     $in('#sp-mem-check').on('click', function () {
+        if (currentCharacterExcluded()) return;
         refreshMemoryStatus();
         showToast('已刷新记忆状态');
     });
     $in('#sp-mem-fill').on('click', async function () {
+        if (currentCharacterExcluded()) return;
         if ($(this).prop('disabled')) return;
         setMemoryProgressVisible(true);
         $(this).prop('disabled', true);
@@ -7747,6 +7882,7 @@ function bindMemoryHandlers() {
         }
     });
     $in('#sp-mem-rebuild').on('click', async function () {
+        if (currentCharacterExcluded()) return;
         const r = memory.getHealthReport();
         const cost = r.totalGroups;
         const ok = await spConfirm({
@@ -8088,6 +8224,56 @@ async function renderWiExcludeList() {
         _filterWiExcludeList(String(this.value || '').trim().toLowerCase());
     });
     if ($search.val()) _filterWiExcludeList(String($search.val()).trim().toLowerCase());
+}
+
+function renderCharacterExcludeList() {
+    const $list = $in('#sp-character-exclude-list');
+    if (!$list.length) return;
+    const cards = currentCharacterCards();
+    const excluded = excludedCharacterSet(getSettings());
+    _syncCharacterExcludeCount(excluded.size, cards.length);
+    if (!cards.length) {
+        $list.html('<span class="sp-cfg-hint">当前没有任何角色卡。</span>');
+        return;
+    }
+    $list[0].innerHTML = renderCharacterExclusionRows(cards, excluded, { escapeHtml, escapeAttr });
+    $list.off('.charx').on('change.charx', '.sp-character-exclude-cb', async function () {
+        const avatar = String($(this).attr('data-avatar') || '');
+        const wasCurrentExcluded = currentCharacterExcluded();
+        if (!updateCharacterExcluded(getSettings(), avatar, this.checked)) return;
+        stSaveSettings();
+        $(this).closest('.sp-wi-exclude-row').toggleClass('sp-wi-exclude-on', this.checked);
+        _syncCharacterExcludeCount(excludedCharacterSet(getSettings()).size, cards.length);
+        const nowCurrentExcluded = currentCharacterExcluded();
+        if (!wasCurrentExcluded && nowCurrentExcluded) {
+            applyPluginEnabled(false, { characterExcluded: true });
+            ensureExcludedCharacterSettingsOnly();
+            void renderMemorySection();
+            void renderStorageUsage();
+            void renderCurrentChatStorageMode();
+        } else if (wasCurrentExcluded && !nowCurrentExcluded) {
+            await restoreCurrentCharacterAfterExclusion();
+        }
+    });
+    const $search = $in('#sp-character-exclude-search');
+    $search.off('.charx').on('input.charx', function () {
+        _filterCharacterExcludeList(String(this.value || ''));
+    });
+    if ($search.val()) _filterCharacterExcludeList(String($search.val()));
+}
+
+function _filterCharacterExcludeList(query) {
+    $inAll('#sp-character-exclude-list .sp-wi-exclude-row').each(function () {
+        const card = { name: this.querySelector?.('.sp-wi-exclude-name')?.textContent || '', avatar: this.getAttribute('data-avatar') || '' };
+        this.style.display = characterCardMatches(card, query) ? '' : 'none';
+    });
+}
+
+function _syncCharacterExcludeCount(excludedN, totalN) {
+    const $count = $in('#sp-character-exclude-count');
+    if (!$count.length) return;
+    $count.text(excludedN > 0 ? `已排除 ${excludedN} / 共 ${totalN}` : `共 ${totalN}`)
+        .toggleClass('sp-wi-exclude-count-active', excludedN > 0);
 }
 
 // 查找框纯前端过滤：名字含关键词的行显示、其余隐藏；空词全显。

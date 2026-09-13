@@ -25,6 +25,7 @@ registerExternalStorageContext(getContext);
 // UI 忙碌态（setFabBusy）、调试面板数据源（setLastDebugPayload）与消息构建器（buildMessages）。
 // 仅搬移网络层时这三点仍属于 index.js 的职责，桥接不改变任何业务逻辑。
 const _bridge = {
+    enabled: pluginEnabled,
     setFabBusy: () => {},
     setLastDebugPayload: () => {},
     buildMessages: null,
@@ -32,6 +33,7 @@ const _bridge = {
 };
 
 export function bindApiClient(bridge) {
+    if (bridge?.enabled) _bridge.enabled = bridge.enabled;
     if (bridge?.setFabBusy) _bridge.setFabBusy = bridge.setFabBusy;
     if (bridge?.setLastDebugPayload) _bridge.setLastDebugPayload = bridge.setLastDebugPayload;
     if (bridge?.buildMessages) _bridge.buildMessages = bridge.buildMessages;
@@ -199,7 +201,7 @@ async function postChatCompletionCore({ cfg, messages, maxTokens, temperature, s
     const signal = normalizeAbortSignal(inputSignal);
     throwIfPreAborted(signal);
     // 总开关硬闸：插件关闭时挡住一切生成（手动 + 后台判定），防任何路径漏网。tag 供调用方识别、静默处理。
-    if (!pluginEnabled()) { const e = makeDiagnosticError('config-missing'); e.spDisabled = true; throw e; }
+    if (!_bridge.enabled()) { const e = makeDiagnosticError('config-missing'); e.spDisabled = true; throw e; }
     if (isStorageBusy() || (isExternalMode() && !isExternalReady())) {
         const error = new Error(isStorageBusy() ? '构画正在迁移当前聊天，已暂停生成' : '当前聊天的外置构画数据尚未加载或后端不可用，请重试加载后再生成');
         error.phase = 'storage';
