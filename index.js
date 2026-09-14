@@ -1351,6 +1351,7 @@ const MODULE_INTROS = {
     lines:
         _iLede('「线」有“平行事件”和“冷知识”两页。平行事件追踪仍在发展的伏笔、人物行动与局势；冷知识要先在设置 → 注入与内容设置 → 功能与内容开关开启“冷知识”，才会参与生成和显示。') +
         _iSub('线可按回合数自动推进、在故事日期变化时推进，或只接受手动推进；策略在设置 → 推进设置 → 线。潜伏注入必须同时开启总开关和线自己的“潜伏注入主楼 AI”。') +
+        _iKey('fa-clock-rotate-left', '历史版本', '线主页“重新生成”左侧的回退入口。保留最近 10 份旧版，当前版另计；按真实生成时间从新到旧排列，旧数据时间未知时会如实标明。选择版本可先预览，再确认恢复；恢复后会成为当前线，供后台潜伏注入、“当前内容”手动注入和后续更新使用。恢复前的当前版也会保留，可再次选回。历史从功能启用后的内容更新开始积累，暂无版本时会提示。') +
         _iKey('fa-rotate-right', '重新生成', '重做未锁定的线；锁定线保留') +
         _iKey('fa-forward',      '推进',     '更新已有线，并可能新增少量真正独立的事件') +
         _iKey('fa-plus',         '新增冷知识', '在“冷知识”页选择主题生成；只在冷知识开关开启后可用') +
@@ -1568,12 +1569,14 @@ const linesFeature = createLinesFeature({
     isEditing: () => manualEditing.lines,
     readSaved: () => readStore(getLinesCacheKey()) || {},
     writeStore, writeStoreConfirmed, readRaw: () => readStore(getLinesCacheKey())?.raw || '',
-    restoreBaseline: baseline => { if (!baseline || baseline.chatId !== getContext().chatId) return; const key = getLinesCacheKey(); if (!key) return; if (baseline.raw) writeStore(key, { raw: baseline.raw, ts: baseline.ts || Date.now() }); else removeStore(key); },
+    restoreBaseline: baseline => { if (!baseline || baseline.chatId !== getContext().chatId) return; const key = getLinesCacheKey(); if (!key) return; if (baseline.store && typeof baseline.store === 'object') writeStore(key, baseline.store); else if (baseline.raw) writeStore(key, { raw: baseline.raw, ts: baseline.ts || Date.now() }); else removeStore(key); },
     loadConfig: loadCfg, swipeId: mesId => getContext().chat?.[mesId]?.swipe_id ?? 0,
     refreshInlineWindow: refreshInlineWindow,
     freezeSnapshot: freezeSnapshotToFloor,
     isPanelActive: () => linesMode, notifyMode: () => getSettings().notifyMode,
     toast: (message, error) => showToast(message, null, error),
+    dialog: customDialog,
+    storageStatus,
     pluginEnabled, getSettings, getMode: getLinesMode, getInterval: getLinesInterval,
     floorSignature: _floorSig, messageText: mid => getContext().chat?.[mid]?.mes,
     chat: () => getContext().chat, lastAssistant: () => snapshotLastAssistant(getContext().chat),
@@ -2923,6 +2926,10 @@ function onFabPointerEnd(ev) {
     if (captureTarget?.hasPointerCapture?.(pointerId)) captureTarget.releasePointerCapture(pointerId);
 }
 
+function bindLinesHistoryUi($linesWrap) {
+    $linesWrap.on('click', '.sp-lines-history', function (e) { e.stopPropagation(); void linesFeature.openHistory(); });
+}
+
 function injectModal() {
     const cfg = loadCfg();
     const hasCustomApi = !!(cfg.url && cfg.key);
@@ -3708,6 +3715,7 @@ function injectModal() {
     $linesWrap.on('click', '.sp-lines-dashed-add', () => linesFeature.dashed.openDialog());
     $linesWrap.on('click', '.sp-lines-dashed-lock', function () { linesFeature.dashed.toggle($(this).attr('data-id')); });
     $linesWrap.on('click', '.sp-lines-dashed-delete', function () { linesFeature.dashed.remove($(this).attr('data-id')); });
+    bindLinesHistoryUi($linesWrap);
     $in('#sp-body').on('click', '#sp-gen-schedule-now, .sp-refresh-schedule', onRegenClick);
     // 点视图头部 📌：固定/取消固定当前 char（只在 char 视角出现）。名字取按钮 data-name，兜底 charViewName。
     $in('#sp-body').on('click', '.sp-point-pin-char', function () {
@@ -7176,6 +7184,9 @@ function bindStorageHandlers() {
         const before = storageStatus().chatId;
         await loadExternalChat({ force: true });
         if (storageStatus().chatId !== before) return;
+        if (storageStatus().status === 'ready') {
+            linesFeature.reconcileHistoryStorage();
+        }
         renderCurrentChatStorageMode(); renderStorageUsage();
         showToast(storageStatus().status === 'ready' ? '外置构画数据已重新加载' : `重试失败：${storageStatus().error || '后端不可用'}`, null, storageStatus().status !== 'ready');
     });
