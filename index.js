@@ -1720,7 +1720,7 @@ const spaceFeature = createSpaceFeature({
         },
         readWorldInfo: ctx => buildWorldInfoContext(ctx),
         readMemory: () => getMemText(),
-        readRecent: ctx => buildRecentChatContext(ctx),
+        readRecent: ctx => buildRecentChatContext(ctx, 6, Infinity),
         readCardExtras,
         readAlmanacText: () => getAlmanacInjectText(),
         readCalendarText: () => getCalDescInjectText(),
