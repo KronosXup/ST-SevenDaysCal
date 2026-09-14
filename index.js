@@ -1755,6 +1755,7 @@ let theaterMode          = false;
 // 暗历内联编辑态/归档折叠态/批量模式已随 ledger 渲染层迁入 business/ledger/render.js
 // （经 getLedgerEditor、归档/批量 actions 与 resetLedgerRenderState 复位）。
 const _injectTexts      = {};
+const _injectIdsByText  = new Map();
 let   _injectIdSeq      = 0;
 let viewportSyncBound   = false;
 
@@ -6255,8 +6256,12 @@ async function buildMessages(ctx, prompt, userName, charName, historyLimit = 3, 
 // ─── Inject ───────────────────────────────────────────────────────────────────
 
 function makeInjectBtn(text) {
-    const id = ++_injectIdSeq;
-    _injectTexts[id] = text;
+    let id = typeof text === 'string' ? _injectIdsByText.get(text) : undefined;
+    if (id === undefined) {
+        id = ++_injectIdSeq;
+        _injectTexts[id] = text;
+        if (typeof text === 'string') _injectIdsByText.set(text, id);
+    }
     return `<button class="sp-inject-btn" data-iid="${id}" title="注入到输入框"><i class="fa-solid fa-arrow-right-to-bracket"></i></button>`;
 }
 
